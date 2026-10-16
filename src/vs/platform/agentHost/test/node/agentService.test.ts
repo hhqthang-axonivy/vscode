@@ -14131,6 +14131,76 @@ suite('AgentService (node dispatcher)', () => {
 				]);
 			});
 
+			test('legacy sessions their provider cannot read its catalog for are parked, then woken and converted when it becomes readable', async () => {
+				// Production: about 70 older codex sessions whose provider is registered but whose catalog is unreadable
+				// had their session database opened on every pass, indefinitely.
+				let catalogReadable = false;
+				class InitiallyUnreadableCatalogAgent extends TimedExternalAgent {
+					override async listChatsToMigrate(): Promise<IAgentListedChat[] | typeof AgentChatMigrationDeferred> {
+						return catalogReadable ? [] : AgentChatMigrationDeferred;
+					}
+					override async listSessions() {
+						return [];
+					}
+					override async getChatMetadata(chat: URI): Promise<IAgentChatMetadata | undefined> {
+						return catalogReadable ? { chat, startTime: 10, modifiedTime: 10, summary: 'Older' } : undefined;
+					}
+				}
+				// The real database: the test double cannot convert a catalog.
+				const orchestratorDatabase = disposables.add(new AgentHostDatabase(':memory:'));
+				const sessions = Array.from({ length: 70 }, (_, index) => AgentSession.uri('copilot', `older-${index}`));
+				for (const session of sessions) {
+					await orchestratorDatabase.registerRuntimeSession(session.toString(), {
+						provider: 'copilot', startTime: 10, modifiedTime: 10, source: 'explicit',
+					}, { checkTombstone: false });
+				}
+				const sessionData = createPerSessionDataService();
+				for (const session of sessions) {
+					await sessionData.database(session).createTurn('turn-1');
+				}
+				const svc = disposables.add(createTestAgentService(
+					new NullLogService(), fileService, sessionData.service, { _serviceBrand: undefined } as IProductService, createNoopGitService(),
+					undefined, undefined, undefined, undefined, undefined, [], undefined, undefined, orchestratorDatabase, undefined, undefined,
+					// Passes run only when the test runs them, as user activity runs them every 30 s.
+					{ schedule: () => toDisposable(() => { }) },
+				));
+				await svc.whenCatalogReconciliationIdle();
+				const agent = disposables.add(new InitiallyUnreadableCatalogAgent('copilot'));
+				registerTestAgentProvider(svc, agent);
+				await waitForInitialProviderMigration(svc, agent);
+				const runPass = async () => {
+					sessionData.databaseOpens.length = 0;
+					const outcomes = await runCatalogReconciliationPass(svc) as readonly { readonly status: string; readonly reason: string }[];
+					return { databaseOpens: sessionData.databaseOpens.length, outcomes: [...new Set(outcomes.map(outcome => `${outcome.status} ${outcome.reason}`))] };
+				};
+
+				const unreadable: Awaited<ReturnType<typeof runPass>>[] = [];
+				for (let pass = 0; pass < 6; pass++) {
+					unreadable.push(await runPass());
+				}
+				catalogReadable = true;
+				await (svc as unknown as { _awaitInitialProviderMigrationForProvider(provider: IAgent, requireReadableCatalog: boolean): Promise<boolean> })._awaitInitialProviderMigrationForProvider(agent, true);
+				const readable = [await runPass(), await runPass()];
+				const snapshots = await orchestratorDatabase.readCatalogSnapshot(sessions.map(session => session.toString()));
+
+				assert.deepStrictEqual({
+					unreadable,
+					readable: readable.map(pass => pass.outcomes),
+					converted: snapshots.filter(snapshot => snapshot.authorityVersion === 2).length,
+				}, {
+					// Each session's storage is opened only by the re-projection that parks it, in a batch of 50 (unparked: 150 opens
+					// every pass, indefinitely). Conversion opens nothing while it cannot convert.
+					unreadable: [
+						{ databaseOpens: 150, outcomes: ['retry providerUnavailable'] },
+						{ databaseOpens: 60, outcomes: ['retry providerUnavailable'] },
+						...Array.from({ length: 4 }, () => ({ databaseOpens: 0, outcomes: [] })),
+					],
+					// Woken, each re-projection finds its aggregate current, which releases its conversion.
+					readable: [['skipped synchronized'], ['skipped synchronized']],
+					converted: sessions.length,
+				});
+			});
+
 			test('keeps a provisional session the provider can still describe', async () => {
 				// The marker survived but materialization did happen (a promotion
 				// write that never landed). The provider vouches, so the session
